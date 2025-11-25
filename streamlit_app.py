@@ -1,5 +1,6 @@
 import math
 from pathlib import Path
+import shutil
 
 import pandas as pd
 import streamlit as st
@@ -48,6 +49,15 @@ def load_data(csv_path: Path) -> pd.DataFrame:
     return df
 
 
+@st.cache_data
+def get_error_filenames(df: pd.DataFrame):
+    cond_v1 = ~df["correct_v1"]
+    cond_v2 = ~df["correct_v2"]
+    cond_diff = df["predicted_v1_norm"] != df["predicted_v2_norm"]
+    subset = df[cond_v1 | cond_v2 | cond_diff]
+    return set(subset["file"].astype(str))
+
+
 def get_audio_bytes(filename: str):
     if filename in st.session_state.audio_cache:
         return st.session_state.audio_cache[filename]
@@ -72,11 +82,14 @@ def safe_acc(series):
 
 
 df = load_data(CSV_PATH)
+error_filenames = get_error_filenames(df)
 
 with st.sidebar:
-    st.markdown("### Audio folder")
+    st.markdown("### Audio folder (target)")
     current_dir = "" if AUDIO_DIR is None else str(AUDIO_DIR)
-    audio_dir_input = st.text_input("Path", value=current_dir, placeholder="audio or /data/audio")
+    audio_dir_input = st.text_input(
+        "Path", value=current_dir, placeholder="audio or /data/audio"
+    )
     if audio_dir_input.strip():
         AUDIO_DIR = Path(audio_dir_input.strip())
         AUDIO_DIR.mkdir(parents=True, exist_ok=True)
@@ -84,40 +97,61 @@ with st.sidebar:
         st.warning(f"Folder does not exist: {AUDIO_DIR}")
     st.markdown("---")
 
-tab_main, tab_upload = st.tabs(["Overview", "Upload Audio"])
+tab_main, tab_upload = st.tabs(["Overview", "Import from folder"])
 
 with tab_upload:
-    st.subheader("Upload audio files (filename must match CSV `file`)")
+    st.subheader("Import audio files from a folder")
 
-    uploaded_files = st.file_uploader(
-        "Choose file(s)",
-        type=["wav", "mp3", "ogg", "flac"],
-        accept_multiple_files=True,
+    source_dir_str = st.text_input(
+        "Source folder path",
+        value="",
+        placeholder="E.g. C:/data/raw_audio or /mnt/audio",
     )
 
-    if uploaded_files:
-        added = 0
-        for up in uploaded_files:
-            name = up.name
-            data = up.read()
-            target_path = AUDIO_DIR / name
-            try:
-                with open(target_path, "wb") as f:
-                    f.write(data)
-                if name in st.session_state.audio_cache:
-                    del st.session_state.audio_cache[name]
-                added += 1
-            except Exception as e:
-                st.error(f"Failed to save {name}: {e}")
+    if st.button("Import files"):
+        if not source_dir_str.strip():
+            st.error("Please enter a source folder path.")
+        else:
+            src = Path(source_dir_str.strip())
+            if not src.exists() or not src.is_dir():
+                st.error(f"Source folder not found: {src}")
+            else:
+                imported = 0
+                failed = 0
 
-        st.success(f"Saved {added} file(s) into {AUDIO_DIR}")
+                for p in src.iterdir():
+                    if not p.is_file():
+                        continue
+                    name = p.name
+
+                    # only import files belonging to error/diff cases
+                    if name not in error_filenames:
+                        continue
+
+                    target_path = AUDIO_DIR / name
+                    try:
+                        shutil.copy2(p, target_path)
+                        if name in st.session_state.audio_cache:
+                            del st.session_state.audio_cache[name]
+                        imported += 1
+                    except Exception:
+                        failed += 1
+
+                st.success(
+                    f"Imported {imported} error/diff file(s) into {AUDIO_DIR}"
+                )
+                if failed:
+                    st.warning(f"Failed to import {failed} file(s).")
 
     existing_files = {p.name for p in AUDIO_DIR.glob("*") if p.is_file()}
-    matched = len(set(df["file"].astype(str)).intersection(existing_files))
-    st.info(f"Files in audio folder matching CSV: {matched} / {df['file'].nunique()}")
+    matched_error = len(error_filenames.intersection(existing_files))
+    st.info(
+        f"Files in audio folder matching error/diff cases: "
+        f"{matched_error} / {len(error_filenames)}"
+    )
 
-    st.write("Sample filenames from CSV:")
-    st.write(df["file"].head(10).tolist())
+    st.write("Sample filenames from CSV (error/diff cases):")
+    st.write(list(sorted(error_filenames))[:10])
 
 
 with tab_main:
@@ -170,7 +204,6 @@ with tab_main:
         pred_filter = st.selectbox(
             "Prediction condition",
             options=[
-                "All",
                 "v1 incorrect",
                 "v2 incorrect",
                 "both incorrect",
