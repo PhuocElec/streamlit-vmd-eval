@@ -97,51 +97,45 @@ with st.sidebar:
         st.warning(f"Folder does not exist: {AUDIO_DIR}")
     st.markdown("---")
 
-tab_main, tab_upload = st.tabs(["Overview", "Import from folder"])
+tab_main, tab_upload = st.tabs(["Overview", "Upload files"])
 
 with tab_upload:
-    st.subheader("Import audio files from a folder")
+    st.subheader("Upload audio files for error/diff cases")
 
-    source_dir_str = st.text_input(
-        "Source folder path",
-        value="",
-        placeholder="E.g. C:/data/raw_audio or /mnt/audio",
+    uploaded_files = st.file_uploader(
+        "Choose file(s)",
+        type=["wav", "mp3", "ogg", "flac"],
+        accept_multiple_files=True,
     )
 
-    if st.button("Import files"):
-        if not source_dir_str.strip():
-            st.error("Please enter a source folder path.")
-        else:
-            src = Path(source_dir_str.strip())
-            if not src.exists() or not src.is_dir():
-                st.error(f"Source folder not found: {src}")
-            else:
-                imported = 0
-                failed = 0
+    if uploaded_files:
+        imported = 0
+        skipped = 0
+        failed = 0
 
-                for p in src.iterdir():
-                    if not p.is_file():
-                        continue
-                    name = p.name
+        for up in uploaded_files:
+            name = up.name
 
-                    # only import files belonging to error/diff cases
-                    if name not in error_filenames:
-                        continue
+            if name not in error_filenames:
+                skipped += 1
+                continue
 
-                    target_path = AUDIO_DIR / name
-                    try:
-                        shutil.copy2(p, target_path)
-                        if name in st.session_state.audio_cache:
-                            del st.session_state.audio_cache[name]
-                        imported += 1
-                    except Exception:
-                        failed += 1
+            data = up.read()
+            target_path = AUDIO_DIR / name
+            try:
+                with open(target_path, "wb") as f:
+                    f.write(data)
+                if name in st.session_state.audio_cache:
+                    del st.session_state.audio_cache[name]
+                imported += 1
+            except Exception:
+                failed += 1
 
-                st.success(
-                    f"Imported {imported} error/diff file(s) into {AUDIO_DIR}"
-                )
-                if failed:
-                    st.warning(f"Failed to import {failed} file(s).")
+        st.success(f"Imported {imported} file(s) into {AUDIO_DIR}")
+        if skipped:
+            st.info(f"Skipped {skipped} file(s) not belonging to error/diff cases.")
+        if failed:
+            st.warning(f"Failed to save {failed} file(s).")
 
     existing_files = {p.name for p in AUDIO_DIR.glob("*") if p.is_file()}
     matched_error = len(error_filenames.intersection(existing_files))
