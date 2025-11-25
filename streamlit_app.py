@@ -81,21 +81,34 @@ def safe_acc(series):
     return float(series.mean())
 
 
+def format_acc(count: int, total: int) -> str:
+    if total == 0:
+        return "0.00% (0/0)"
+    pct = count / total * 100.0
+    return f"{pct:.2f}% ({count}/{total})"
+
+
 df = load_data(CSV_PATH)
 error_filenames = get_error_filenames(df)
 
+# Sidebar filters
 with st.sidebar:
-    st.markdown("### Audio folder (target)")
-    current_dir = "" if AUDIO_DIR is None else str(AUDIO_DIR)
-    audio_dir_input = st.text_input(
-        "Path", value=current_dir, placeholder="audio or /data/audio"
+    st.subheader("Filters")
+    actual_filter = st.selectbox(
+        "Actual label",
+        options=["All", "voicemail", "non_voicemail"],
+        index=0,
     )
-    if audio_dir_input.strip():
-        AUDIO_DIR = Path(audio_dir_input.strip())
-        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    if AUDIO_DIR is not None and not AUDIO_DIR.exists():
-        st.warning(f"Folder does not exist: {AUDIO_DIR}")
-    st.markdown("---")
+    pred_filter = st.selectbox(
+        "Prediction condition",
+        options=[
+            "v1 incorrect",
+            "v2 incorrect",
+            "both incorrect",
+            "different between models",
+        ],
+        index=0,
+    )
 
 tab_main, tab_upload = st.tabs(["Overview", "Upload files"])
 
@@ -151,31 +164,35 @@ with tab_upload:
 with tab_main:
     st.subheader("Model Comparison")
 
-    overall_acc_v1 = safe_acc(df["correct_v1"])
-    overall_acc_v2 = safe_acc(df["correct_v2"])
+    overall_total = len(df)
+    overall_correct_v1 = int(df["correct_v1"].sum())
+    overall_correct_v2 = int(df["correct_v2"].sum())
 
     df_vm = df[df["actual_norm"] == "voicemail"]
     df_nvm = df[df["actual_norm"] == "non_voicemail"]
 
-    vm_acc_v1 = safe_acc(df_vm["correct_v1"])
-    vm_acc_v2 = safe_acc(df_vm["correct_v2"])
+    vm_total = len(df_vm)
+    nvm_total = len(df_nvm)
 
-    nvm_acc_v1 = safe_acc(df_nvm["correct_v1"])
-    nvm_acc_v2 = safe_acc(df_nvm["correct_v2"])
+    vm_correct_v1 = int(df_vm["correct_v1"].sum())
+    vm_correct_v2 = int(df_vm["correct_v2"].sum())
+
+    nvm_correct_v1 = int(df_nvm["correct_v1"].sum())
+    nvm_correct_v2 = int(df_nvm["correct_v2"].sum())
 
     metrics = pd.DataFrame(
         [
             {
                 "Model": "v1",
-                "Accuracy": f"{overall_acc_v1 * 100:.2f}%",
-                "Accuracy (voicemail)": f"{vm_acc_v1 * 100:.2f}%",
-                "Accuracy (non_voicemail)": f"{nvm_acc_v1 * 100:.2f}%",
+                "Accuracy": format_acc(overall_correct_v1, overall_total),
+                "Accuracy (voicemail)": format_acc(vm_correct_v1, vm_total),
+                "Accuracy (non_voicemail)": format_acc(nvm_correct_v1, nvm_total),
             },
             {
                 "Model": "v2",
-                "Accuracy": f"{overall_acc_v2 * 100:.2f}%",
-                "Accuracy (voicemail)": f"{vm_acc_v2 * 100:.2f}%",
-                "Accuracy (non_voicemail)": f"{nvm_acc_v2 * 100:.2f}%",
+                "Accuracy": format_acc(overall_correct_v2, overall_total),
+                "Accuracy (voicemail)": format_acc(vm_correct_v2, vm_total),
+                "Accuracy (non_voicemail)": format_acc(nvm_correct_v2, nvm_total),
             },
         ]
     )
@@ -184,27 +201,6 @@ with tab_main:
 
     st.markdown("---")
     st.subheader("Browse & Listen")
-
-    col_filter1, col_filter2 = st.columns(2)
-
-    with col_filter1:
-        actual_filter = st.selectbox(
-            "Actual label",
-            options=["All", "voicemail", "non_voicemail"],
-            index=0,
-        )
-
-    with col_filter2:
-        pred_filter = st.selectbox(
-            "Prediction condition",
-            options=[
-                "v1 incorrect",
-                "v2 incorrect",
-                "both incorrect",
-                "different between models",
-            ],
-            index=0,
-        )
 
     filtered = df.copy()
 
