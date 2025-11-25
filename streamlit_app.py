@@ -1,6 +1,5 @@
 import math
 from pathlib import Path
-import shutil
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +24,18 @@ if "audio_cache" not in st.session_state:
 
 if "page" not in st.session_state:
     st.session_state.page = 1
+
+if "actual_filter" not in st.session_state:
+    st.session_state.actual_filter = "All"
+
+if "pred_filter" not in st.session_state:
+    st.session_state.pred_filter = "v1 incorrect"
+
+if "actual_filter_input" not in st.session_state:
+    st.session_state.actual_filter_input = st.session_state.actual_filter
+
+if "pred_filter_input" not in st.session_state:
+    st.session_state.pred_filter_input = st.session_state.pred_filter
 
 
 @st.cache_data
@@ -91,15 +102,16 @@ def format_acc(count: int, total: int) -> str:
 df = load_data(CSV_PATH)
 error_filenames = get_error_filenames(df)
 
-# Sidebar filters
 with st.sidebar:
     st.subheader("Filters")
-    actual_filter = st.selectbox(
+    st.session_state.actual_filter_input = st.selectbox(
         "Actual label",
         options=["All", "voicemail", "non_voicemail"],
-        index=0,
+        index=["All", "voicemail", "non_voicemail"].index(
+            st.session_state.actual_filter
+        ),
     )
-    pred_filter = st.selectbox(
+    st.session_state.pred_filter_input = st.selectbox(
         "Prediction condition",
         options=[
             "v1 incorrect",
@@ -107,8 +119,18 @@ with st.sidebar:
             "both incorrect",
             "different between models",
         ],
-        index=0,
+        index=[
+            "v1 incorrect",
+            "v2 incorrect",
+            "both incorrect",
+            "different between models",
+        ].index(st.session_state.pred_filter),
     )
+
+    if st.button("Apply filters"):
+        st.session_state.actual_filter = st.session_state.actual_filter_input
+        st.session_state.pred_filter = st.session_state.pred_filter_input
+        st.session_state.page = 1
 
 tab_main, tab_upload = st.tabs(["Overview", "Upload files"])
 
@@ -203,6 +225,9 @@ with tab_main:
     st.subheader("Browse & Listen")
 
     filtered = df.copy()
+
+    actual_filter = st.session_state.actual_filter
+    pred_filter = st.session_state.pred_filter
 
     if actual_filter == "voicemail":
         filtered = filtered[filtered["actual_norm"] == "voicemail"]
