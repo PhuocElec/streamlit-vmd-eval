@@ -1,8 +1,12 @@
 import math
-import requests
+import threading
+import time
+import hashlib
+import queue
 from pathlib import Path
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from settings import settings
@@ -12,6 +16,10 @@ from settings import settings
 AUDIO_DIR = Path("audio")
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CSV_PATH = DATA_DIR / "eval_results.csv"
+
 PAGE_SIZE = 20
 
 st.set_page_config(
@@ -20,21 +28,46 @@ st.set_page_config(
 )
 
 
+# ================== PERSIST ==================
+def load_df():
+    if CSV_PATH.exists():
+        return pd.read_csv(CSV_PATH)
+    return pd.DataFrame(
+        columns=["file", "file_hash", "actual", "predicted_old", "predicted_new"]
+    )
+
+
+def append_row(row: dict):
+    df = pd.DataFrame([row])
+    df.to_csv(
+        CSV_PATH,
+        mode="a",
+        header=not CSV_PATH.exists(),
+        index=False,
+    )
+
+
 # ================== SESSION STATE ==================
-if "audio_cache" not in st.session_state:
-    st.session_state.audio_cache = {}
+def init_state():
+    ss = st.session_state
 
-if "page" not in st.session_state:
-    st.session_state.page = 1
+    ss.setdefault("audio_cache", {})
+    ss.setdefault("page", 1)
+    ss.setdefault("actual_filter", "All")
+    ss.setdefault("pred_filter", "All")
 
-if "df_eval" not in st.session_state:
-    st.session_state.df_eval = None
+    ss.setdefault("df_eval", load_df())
 
-if "actual_filter" not in st.session_state:
-    st.session_state.actual_filter = "All"
+    ss.setdefault("running", False)
+    ss.setdefault("progress", 0.0)
+    ss.setdefault("total_jobs", 0)
+    ss.setdefault("done_jobs", 0)
 
-if "pred_filter" not in st.session_state:
-    st.session_state.pred_filter = "All"
+    ss.setdefault("result_queue", queue.Queue())
+    ss.setdefault("worker_thread", None)
+
+
+init_state()
 
 
 # ================== UTILS ==================
@@ -47,6 +80,10 @@ def norm_label(x: str) -> str:
     return s
 
 
+def file_hash(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
 def call_model(api_url: str, filename: str, file_bytes: bytes) -> str:
     files = {"file": (filename, file_bytes)}
     resp = requests.post(api_url, files=files, timeout=60)
@@ -55,13 +92,14 @@ def call_model(api_url: str, filename: str, file_bytes: bytes) -> str:
 
 
 def get_audio_bytes(filename: str):
-    if filename in st.session_state.audio_cache:
-        return st.session_state.audio_cache[filename]
+    cache = st.session_state.audio_cache
+    if filename in cache:
+        return cache[filename]
 
     path = AUDIO_DIR / filename
     if path.exists():
         data = path.read_bytes()
-        st.session_state.audio_cache[filename] = data
+        cache[filename] = data
         return data
     return None
 
@@ -71,6 +109,61 @@ def format_acc(correct: int, total: int) -> str:
         return "0.00% (0/0)"
     pct = correct / total * 100
     return f"{pct:.2f}% ({correct}/{total})"
+
+
+# ================== BACKGROUND WORKER (PURE PYTHON) ==================
+def worker(jobs, result_q):
+    """
+    ❗ KHÔNG dùng st.session_state trong hàm này
+    """
+    for job in jobs:
+        try:
+            old = call_model(
+                settings.OLD_MODEL_API_URL,
+                job["file"],
+                job["bytes"],
+            )
+            new = call_model(
+                settings.NEW_MODEL_API_URL,
+                job["file"],
+                job["bytes"],
+            )
+
+            result_q.put(
+                {
+                    "file": job["file"],
+                    "file_hash": job["hash"],
+                    "actual": job["actual"],
+                    "predicted_old": old,
+                    "predicted_new": new,
+                }
+            )
+        except Exception as e:
+            result_q.put({"error": str(e)})
+
+    # báo hiệu đã xong
+    result_q.put({"_done": True})
+
+
+# ================== SYNC RESULT QUEUE (MAIN THREAD ONLY) ==================
+while not st.session_state.result_queue.empty():
+    item = st.session_state.result_queue.get()
+
+    if "_done" in item:
+        st.session_state.running = False
+        continue
+
+    if "error" in item:
+        st.error(item["error"])
+        continue
+
+    append_row(item)
+    st.session_state.df_eval.loc[len(st.session_state.df_eval)] = item
+
+    st.session_state.done_jobs += 1
+    st.session_state.progress = (
+        st.session_state.done_jobs / st.session_state.total_jobs
+    )
 
 
 # ================== SIDEBAR ==================
@@ -104,12 +197,11 @@ tab_main, tab_eval = st.tabs(
 with tab_main:
     st.subheader("Overview & Listen")
 
-    if st.session_state.df_eval is None:
+    df = st.session_state.df_eval.copy()
+
+    if df.empty:
         st.info("Please run evaluation in the 'Evaluate' tab first.")
     else:
-        df = st.session_state.df_eval.copy()
-
-        # ---- compute on-the-fly ----
         df["_actual"] = df["actual"].apply(norm_label)
         df["_old"] = df["predicted_old"].apply(norm_label)
         df["_new"] = df["predicted_new"].apply(norm_label)
@@ -117,7 +209,6 @@ with tab_main:
         df["_correct_old"] = df["_actual"] == df["_old"]
         df["_correct_new"] = df["_actual"] == df["_new"]
 
-        # ---------- METRICS ----------
         total = len(df)
         vm = df[df["_actual"] == "voicemail"]
         nvm = df[df["_actual"] == "non_voicemail"]
@@ -152,7 +243,6 @@ with tab_main:
         st.markdown("---")
         st.subheader("Browse & Listen")
 
-        # ---------- FILTER ----------
         filtered = df.copy()
 
         if st.session_state.actual_filter != "All":
@@ -172,7 +262,6 @@ with tab_main:
         elif pf == "different between models":
             filtered = filtered[filtered["_old"] != filtered["_new"]]
 
-        # ---------- PAGINATION ----------
         total_rows = len(filtered)
         total_pages = max(1, math.ceil(total_rows / PAGE_SIZE))
         st.session_state.page = min(st.session_state.page, total_pages)
@@ -194,7 +283,6 @@ with tab_main:
         end = start + PAGE_SIZE
         page_df = filtered.iloc[start:end]
 
-        # ---------- AUDIO LIST ----------
         for _, row in page_df.iterrows():
             audio = get_audio_bytes(row["file"])
             c1, c2 = st.columns([5, 3])
@@ -226,56 +314,64 @@ with tab_eval:
         "Upload audio files",
         type=["wav", "mp3", "flac", "ogg"],
         accept_multiple_files=True,
+        disabled=st.session_state.running,
     )
 
     actual_label = st.selectbox(
         "Actual label (ground truth)",
         ["voicemail", "non_voicemail"],
+        disabled=st.session_state.running,
     )
 
-    if st.button("🚀 Run evaluation") and uploaded_files:
-        rows = []
+    col1, col2 = st.columns(2)
 
-        with st.spinner("Calling model APIs..."):
-            for up in uploaded_files:
-                audio_bytes = up.read()
-                filename = up.name
+    with col1:
+        if st.button("🚀 Run evaluation", disabled=st.session_state.running):
+            jobs = []
+            existing_hashes = set(st.session_state.df_eval["file_hash"])
 
-                (AUDIO_DIR / filename).write_bytes(audio_bytes)
-                st.session_state.audio_cache.pop(filename, None)
+            for up in uploaded_files or []:
+                data = up.read()
+                h = file_hash(data)
 
-                try:
-                    rows.append(
-                        {
-                            "file": filename,
-                            "actual": actual_label,
-                            "predicted_old": call_model(
-                                settings.OLD_MODEL_API_URL,
-                                filename,
-                                audio_bytes,
-                            ),
-                            "predicted_new": call_model(
-                                settings.NEW_MODEL_API_URL,
-                                filename,
-                                audio_bytes,
-                            ),
-                        }
-                    )
-                except Exception as e:
-                    st.error(f"Failed on {filename}: {e}")
+                if h in existing_hashes:
+                    continue
 
-        df = pd.DataFrame(rows)
-        st.session_state.df_eval = df
-        st.session_state.page = 1
+                (AUDIO_DIR / up.name).write_bytes(data)
 
-        st.success(f"Evaluated {len(df)} file(s)")
+                jobs.append(
+                    {
+                        "file": up.name,
+                        "bytes": data,
+                        "hash": h,
+                        "actual": actual_label,
+                    }
+                )
 
-        st.download_button(
-            "⬇️ Download CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="voicemail_model_eval.csv",
-            mime="text/csv",
-        )
+            if jobs:
+                st.session_state.total_jobs = len(jobs)
+                st.session_state.done_jobs = 0
+                st.session_state.progress = 0
+                st.session_state.running = True
 
-        # 🔥 FORCE RERUN để Overview cập nhật
-        st.rerun()
+                st.session_state.worker_thread = threading.Thread(
+                    target=worker,
+                    args=(jobs, st.session_state.result_queue),
+                    daemon=True,
+                )
+                st.session_state.worker_thread.start()
+            else:
+                st.warning("No new files to evaluate.")
+
+    with col2:
+        if st.session_state.running:
+            st.progress(st.session_state.progress)
+            st.info(
+                f"Processing {st.session_state.done_jobs}/{st.session_state.total_jobs}"
+            )
+
+
+# ================== AUTO RERUN (MUST BE LAST) ==================
+if st.session_state.running:
+    time.sleep(0.3)
+    st.rerun()
